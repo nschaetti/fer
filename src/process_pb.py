@@ -1,3 +1,5 @@
+"""Picbreeder genome processing utilities and CLI entrypoints."""
+
 import os
 import argparse
 
@@ -14,8 +16,13 @@ import util
 import picbreeder_util
 
 def load_pbcppn(zip_file_path):
-    """
-    Load the raw picbreeder genome from a zip file and convert it to a dictionary of nodes and links (the NEAT graph).
+    """Load and normalize a Picbreeder genome into NEAT-friendly dicts.
+
+    Args:
+        zip_file_path: Path to the zipped XML genome exported from Picbreeder.
+
+    Returns:
+        Dictionary with `nodes`, `links`, and `special_nodes` lookup tables.
     """
     root = picbreeder_util.load_zip_xml_as_dict(zip_file_path)
 
@@ -28,6 +35,7 @@ def load_pbcppn(zip_file_path):
         id_ = node['marking']['@branch']+"_"+node['marking']['@id']
         node = dict(label=node['@label'] if '@label' in node else "", id=id_, activation=node['activation']['#text'][:-3])
         nodes.append(node)
+    # end for
     for link in links_:
         # link = dict(id=int(link['marking']['@id']), source=int(link['source']['@id']), target=int(link['target']['@id']), weight=float(link['weight']['#text']))
 
@@ -35,6 +43,7 @@ def load_pbcppn(zip_file_path):
         target_id = link['target']['@branch']+"_"+link['target']['@id']
         link = dict(id=int(link['marking']['@id']), source=source_id, target=target_id, weight=float(link['weight']['#text']))
         links.append(link)
+    # end for
 
     if 'ink' in [node['label'] for node in nodes]: # convert ink output to hsv standard
         node_v = [node for node in nodes if node['label'] == 'ink'][0]
@@ -43,6 +52,7 @@ def load_pbcppn(zip_file_path):
         nodes.append(dict(label='saturation', id=1000001, activation='identity'))
         links.append(dict(id=1000002, source=node_v['id'], target=1000000, weight=0.))
         links.append(dict(id=1000003, source=node_v['id'], target=1000001, weight=0.))
+    # end if
 
     special_nodes = {}
     special_nodes['x'] = [node['id'] for node in nodes if node['label'] == 'x'][0]
@@ -54,10 +64,16 @@ def load_pbcppn(zip_file_path):
     special_nodes['v'] = [node['id'] for node in nodes if node['label'] == 'brightness'][0]
     # links = [link for link in links if link['weight'] != 0.]
     return dict(nodes=nodes, links=links, special_nodes=special_nodes)
+# end def load_pbcppn
 
 def do_forward_pass(nn):
-    """
-    Do a forward pass through the NEAT graph given by the above function.
+    """Evaluate the NEAT graph produced from a Picbreeder genome.
+
+    Args:
+        nn: Output from `load_pbcppn` containing nodes, links, and special nodes.
+
+    Returns:
+        dict with rendered RGB image and activation values per node.
     """
     res = 256
     x = y = jnp.linspace(-1., 1., res)
@@ -79,30 +95,55 @@ def do_forward_pass(nn):
     node2val = {} #{node['id']: np.zeros_like(x) for node in nn['nodes']}
     node2val[node_x], node2val[node_y], node2val[node_d], node2val[node_b] = x, y, d, b
 
-    def get_value_recur(node, path=[]):
+    def get_value_recur(node, path=None):
+        """Recursively compute each node's activation value.
+
+        Args:
+            node: Node identifier whose activation is requested.
+            path: List tracking recursion path for cycle detection.
+
+        Returns:
+            Tensor representing the node's activation over the grid.
+        """
+        if path is None:
+            path = []
+        # end if
         if node in node2val:
             return node2val[node]
+        # end if
         if node in path:
             print(f'CYCLE: {path}')
             return jnp.zeros_like(x)
+        # end if
         val = jnp.zeros_like(x)
         for node_src, weight in node2in_links[node]:
             val = val + weight * get_value_recur(node_src, path=path+[node])
+        # end for
         node2val[node] = activation_fn_map[node2activation[node]](val)
         return node2val[node]
+    # end def get_value_recur
 
     for node in [node_h, node_s, node_v]: # actual forward pass
         get_value_recur(node, path=[])
+    # end for
     
     h, s, v = node2val[node_h], node2val[node_s], node2val[node_v]
     r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
     rgb = jnp.stack([r, g, b], axis=-1)
     return dict(rgb=rgb, node2val=node2val)
+# end def do_forward_pass
 
 def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
-    """
-    Helper function to get a layeried weight matrix for a specific layer.
-    Don't need to call this directly.
+    """Construct a dense weight matrix for a single CPPN layer.
+
+    Args:
+        net: Layerized NEAT network dictionary.
+        i_layer: Integer index of the layer to convert.
+        nodes_cache: Cache describing which nodes appear per layer.
+        activation_neurons: Architecture string segment containing activation widths.
+
+    Returns:
+        2-D numpy array describing weights from previous to current layer.
     """
     node2activation = {n['id']: n['activation'] for n in net['nodes']}
 
@@ -112,6 +153,15 @@ def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
     position_offset = {act: p for act, p in zip(activations, np.cumsum(np.array([0]+list(d_hidden)[:-1])))}
 
     def get_position_within_layer(nodes_caches_layer, node): # node_id
+        """Return positional index for a node inside a layer.
+
+        Args:
+            nodes_caches_layer: Sequence describing nodes and novelty flags.
+            node: Node identifier being queried.
+
+        Returns:
+            Integer index representing the column ordering.
+        """
         i_node = [n for n, _ in nodes_caches_layer].index(node)
 
         node, act = nodes_caches_layer[i_node]
@@ -121,8 +171,10 @@ def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
                 break
             elif a==act:
                 p+=1
+            # end if
         p = p + position_offset[act]
         return p
+    # end def get_position_within_layer
 
     prev_layer = nodes_cache[i_layer]
     this_layer = nodes_cache[i_layer+1]
@@ -131,6 +183,7 @@ def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
 
     if i_layer==0:
         prev_layer = [(a, 'cache') for a, _ in prev_layer]
+    # end if
 
     weight_mat = np.zeros((sum(d_hidden), sum(d_hidden)))
     for n, act in this_layer:
@@ -143,14 +196,21 @@ def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
             for src, w in [(l['source'], l['weight']) for l in net['links'] if l['target']==n]:
                 p2 = get_position_within_layer(prev_layer, src)
                 weight_mat[p, p2] = w
+            # end for
+        # end if
+    # end for
     return weight_mat.T
+# end def get_weight_matrix
 
 
 def layerize_nn(nn):
-    """
-    Converts the picbreeder NEAT graph to a dense network by layerizing it as described in the paper.
-    Turns the connections which connect to neurons in a few layers into copy operations through multiple layers.
-    This will automatically find the minimal MLP architecture to represent the NEAT graph. 
+    """Convert a NEAT graph into an equivalent layered CPPN description.
+
+    Args:
+        nn: Normalized Picbreeder network dictionary from `load_pbcppn`.
+
+    Returns:
+        dict with rendered outputs, layer cache, architecture string, and flattened params.
     """
     node2activation = {n['id']: n['activation'] for n in nn['nodes']}
     node2out_links = {n['id']: [(l['target'], l['weight']) for l in nn['links'] if l['source'] == n['id']] for n in nn['nodes']}
@@ -173,13 +233,19 @@ def layerize_nn(nn):
         for node in node2val:
             if node in node2layer:
                 continue
+            # end if
             if all(src in node2layer for src, _ in node2in_links[node]):
                 nodes_in_layer.append(node)
+            # end if
+        # end for
         for node in nodes_in_layer:
             node2layer[node] = i_layer
+        # end for
         i_layer += 1
         if not nodes_in_layer:
             break
+        # end if
+    # end while
     
     n_layers = max(node2layer.values()) + 1
     nodes_cache = [[] for i in range(n_layers)] # what nodes are at each layer (layerized)
@@ -189,8 +255,13 @@ def layerize_nn(nn):
             layer_end = n_layers
         elif len(node2out_links[node])>0:
             layer_end = max([node2layer[target] for target, _ in node2out_links[node]])
+        else:
+            layer_end = layer_start + 1
+        # end if
         for i in range(layer_start, layer_end):
             nodes_cache[i].append((node, i==layer_start))
+        # end for
+    # end for
     
     nodes_cache[0] = [(node, False) for node, _ in nodes_cache[0]]
     
@@ -200,9 +271,12 @@ def layerize_nn(nn):
         a = defaultdict(int)
         for node, novel in nodes_layer:
             a[node2activation[node] if novel else "cache"] += 1
+        # end for
         # print(dict(a))
         for k in a:
             arch[k] = max(arch[k], a[k])
+        # end for
+    # end for
     arch = dict(sorted(dict(arch).items()))
     width = sum(arch.values())
     # print("n_nodes=", len(node2val))
@@ -212,9 +286,19 @@ def layerize_nn(nn):
     # print("parameters=", width*width*n_layers)
     features = [jnp.stack([node2val[node] for node, _ in nodes_cache[i]], axis=-1) for i in range(n_layers)]
     def get_novelty(node, nodes_cache_layer):
+        """Return whether a node first appears in a given layer.
+
+        Args:
+            node: Node identifier.
+            nodes_cache_layer: Sequence of tuples `(node_id, is_novel)`.
+
+        Returns:
+            bool indicating whether the node is new at that layer.
+        """
         a = [novelty for n, novelty in nodes_cache_layer if n==node]
         assert len(a) == 1
         return a[0]
+    # end def get_novelty
     nodes_cache[0] = [(node, get_novelty(node, nodes_cache[0])) for node in [node_x, node_y, node_d, node_b]]
     # nodes_cache[-1] = [(node, get_novelty(node, nodes_cache[-1])) for node in [node_h, node_s, node_v]]
     nodes_cache.append([(n, False) for n in [node_h, node_s, node_v]])
@@ -238,6 +322,7 @@ def layerize_nn(nn):
     # params['params'][f'Dense_{n_layers-1}']['kernel'] = jnp.eye(a, b)
     params = cppn.param_reshaper.flatten_single(params)
     return dict(rgb=rgb, node2val=node2val, node2layer=node2layer, features=features, nodes_cache=nodes_cache, arch=arch, cppn=cppn, params=params)
+# end def layerize_nn
 
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
@@ -248,15 +333,29 @@ group.add_argument("--zip_path", type=str, default=None, help="path to rep.zip")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 
 def parse_args(*args, **kwargs):
+    """Parse CLI arguments and convert textual 'none' to `None`.
+
+    Args:
+        *args: Positional overrides passed to argparse.
+        **kwargs: Keyword overrides passed to argparse.
+
+    Returns:
+        argparse.Namespace configured with sanitized values.
+    """
     args = parser.parse_args(*args, **kwargs)
     for k, v in vars(args).items():
         if isinstance(v, str) and v.lower() == "none":
             setattr(args, k, None)  # set all "none" to None
+        # end if
+    # end for
     return args
+# end def parse_args
 
 def main(args):
-    """
-    Layerize the given raw picbreeder genome and save the cppn parameters and image to a directory.
+    """CLI entrypoint to layerize a Picbreeder genome and persist artifacts.
+
+    Args:
+        args: Parsed argparse namespace.
     """
     pbcppn = load_pbcppn(args.zip_path)
     layerize_outputs = layerize_nn(pbcppn)
@@ -269,6 +368,9 @@ def main(args):
         util.save_pkl(args.save_dir, "pbcppn", pbcppn)
         util.save_pkl(args.save_dir, "arch", arch)
         util.save_pkl(args.save_dir, "params", params)
+    # end if
+# end def main
 
 if __name__=="__main__":
     main(parse_args())
+# end if

@@ -1,9 +1,17 @@
+"""Color conversion utilities for CPPN-generated imagery."""
+
 import jax.numpy as jnp
 
 def hsv2rgb(h, s, v):
-    """
-    Convert HSV to RGB.
-    All inputs and outputs should be in the range [0, 1].
+    """Convert HSV values to RGB for array inputs.
+
+    Args:
+        h: Hue tensor in [0, 1].
+        s: Saturation tensor in [0, 1].
+        v: Value tensor in [0, 1].
+
+    Returns:
+        Tuple of `(r, g, b)` tensors in [0, 1] matching the input shape.
     """
     h = h * 360.
 
@@ -23,3 +31,4 @@ def hsv2rgb(h, s, v):
     b = b1 * c1 + b2 * c2 + b3 * c3 + b4 * c4 + b5 * c5 + b6 * c6
     r, g, b = r + m, g + m, b + m
     return r.clip(0., 1.), g.clip(0., 1.), b.clip(0., 1.)
+# end def hsv2rgb

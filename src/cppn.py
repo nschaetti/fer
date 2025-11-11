@@ -1,3 +1,5 @@
+"""Composable pattern producing network definitions and helpers."""
+
 from functools import partial
 import numpy as np
 
@@ -24,20 +26,28 @@ relu = jax.nn.relu
 activation_fn_map = dict(cache=cache, identity=identity, cos=cos, sin=sin, tanh=tanh, sigmoid=sigmoid, gaussian=gaussian, relu=relu)
 
 class CPPN(nn.Module):
-    """
-    CPPN Flax Model.
-    Possible activations: cache (identity), identity, cos, sin, tanh, sigmoid, gaussian, relu.
+    """Flax module implementing a CPPN with configurable activations and widths.
 
-    arch: str should be in the form "12;cache:15,gaussian:4,identity:2,sin:1" which means 12 layers, with each layer containing 15 neurons using cache, 4 neurons using gaussian, 2 neurons using identity, 1 neuron using sin
-    inputs: str should be in the form "y,x,d,b" which means the inputs are y, x, d, b. Don't change this.
-    init_scale: str should be in the form "default" or float. If default uses the default flax initialization scheme (lecun init). If float, it is the scale of the initialization variance (see code).
+    Attributes:
+        arch: Architecture spec as `<layers>;<act>:<width>,...`.
+        inputs: Comma-separated input coordinate names.
+        init_scale: `"default"` for Lecun init or float scaling factor.
     """
-    arch: str = "12;cache:15,gaussian:4,identity:2,sin:1" # means 12 layers, 15 neurons with cache, 4 neurons with gaussian, 2 neurons with identity, 1 neuron with sin
-    inputs: str = "y,x,d,b" # "x,y,d,b,xabs,yabs"
+
+    arch: str = "12;cache:15,gaussian:4,identity:2,sin:1"  # default layer and neuron mix
+    inputs: str = "y,x,d,b"  # "x,y,d,b,xabs,yabs"
     init_scale: str = "default"
 
     @nn.compact
     def __call__(self, x):
+        """Run the CPPN forward pass for a batch of coordinates.
+
+        Args:
+            x: Input tensor whose last dimension matches `len(self.inputs)`.
+
+        Returns:
+            Tuple of `(h, s, v)` activations and the list of intermediate features.
+        """
         n_layers, activation_neurons = self.arch.split(";")
         n_layers = int(n_layers)
 
@@ -52,22 +62,30 @@ class CPPN(nn.Module):
             else:
                 kernel_init = nn.initializers.variance_scaling(scale=float(self.init_scale), mode="fan_in", distribution="truncated_normal")
                 x = nn.Dense(sum(d_hidden), use_bias=False, kernel_init=kernel_init)(x)
-
+            # end if
             x = jnp.split(x, dh_cumsum)
             x = [activation_fn_map[activation](xi) for xi, activation in zip(x, activations)]
             x = jnp.concatenate(x)
 
             features.append(x)
+        # end for
         x = nn.Dense(3, use_bias=False)(x)
         features.append(x)
         # h, s, v = jax.nn.tanh(x) # CHANGED THIS TO TANH
         h, s, v = x
         return (h, s, v), features
+    # end def __call__
 
     def generate_image(self, params, img_size=256, return_features=False):
-        """
-        Generate an image from the CPPN given the parameters at the resolution specified by img_size.
-        If return_features is True, return the intermediate activations of the CPPN as well.
+        """Render the CPPN by sweeping a coordinate grid.
+
+        Args:
+            params: Flax parameters or flattened vector (via `FlattenCPPNParameters`).
+            img_size: Spatial resolution of the square output image.
+            return_features: Whether to also return intermediate activations.
+
+        Returns:
+            RGB image tensor with shape `(img_size, img_size, 3)` and optional features.
         """
         inputs = {}
         x = y = jnp.linspace(-1, 1, img_size)
@@ -84,25 +102,53 @@ class CPPN(nn.Module):
             return rgb, features
         else:
             return rgb
+        # end if
+    # end def generate_image
+# end class CPPN
 
 class FlattenCPPNParameters():
-    """
-    Using evosax==0.1.6 (only old version works!!), flatten the parameters of the CPPN to a single vector.
-    Simplifies and makes useful for various things, like analysis.
-    """
+    """Utility to flatten and unflatten CPPN parameters via EvoSax reshaper."""
+
     def __init__(self, cppn):
+        """Initialize reshaper for a CPPN instance.
+
+        Args:
+            cppn: Instantiated `CPPN` module whose parameters to flatten.
+        """
         self.cppn = cppn
 
         rng = jax.random.PRNGKey(0)
         d_in = len(self.cppn.inputs.split(","))
         self.param_reshaper = evosax.ParameterReshaper(self.cppn.init(rng, jnp.zeros((d_in,))))
         self.n_params = self.param_reshaper.total_params
-    
+    # end def __init__
+
     def init(self, rng):
+        """Sample and flatten random CPPN parameters.
+
+        Args:
+            rng: JAX PRNG key used for parameter initialization.
+
+        Returns:
+            1-D array containing flattened parameters.
+        """
         d_in = len(self.cppn.inputs.split(","))
         params = self.cppn.init(rng, jnp.zeros((d_in,)))
         return self.param_reshaper.flatten_single(params)
+    # end def init
 
     def generate_image(self, params, img_size=256, return_features=False):
+        """Render using flattened parameters by reshaping first.
+
+        Args:
+            params: Flattened CPPN parameter vector.
+            img_size: Output image resolution.
+            return_features: Whether to also return feature activations.
+
+        Returns:
+            Rendered RGB image tensor, plus optional features.
+        """
         params = self.param_reshaper.reshape_single(params)
         return self.cppn.generate_image(params, img_size=img_size, return_features=return_features)
+    # end def generate_image
+# end class FlattenCPPNParameters
